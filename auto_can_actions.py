@@ -1,170 +1,157 @@
 import can
 import subprocess
 import time
+import math
 from datetime import datetime
 
 VCAN = "vcan0"
 
-# CAN IDs
 SPEED_ID = 0x3EA
 SIGNAL_ID = 0x47D
 DOOR_ID = 0x474
 
-# Thresholds: yêu cầu assignment theo km/h, nhưng dashboard / speed byte là MPH
-THRESHOLD_30_KMH_MPH = 19   # ~ 30 km/h
-THRESHOLD_60_KMH_MPH = 37   # ~ 60 km/h
-THRESHOLD_90_KMH_MPH = 56   # ~ 90 km/h
+KMH_PER_MPH = 1.60934
 
-# Trigger flags để tránh gửi lặp liên tục khi speed frame lặp periodic
-done_30 = False
-done_60 = False
-done_90 = False
+last_speed_mph = None
 
 
-def now_str() -> str:
+def now_str():
     return datetime.now().strftime("%H:%M:%S")
 
 
-def log(message: str) -> None:
-    print(f"[{now_str()}] {message}", flush=True)
+def log(msg):
+    print(f"[{now_str()}] {msg}", flush=True)
 
 
-def popup(message: str) -> None:
-    subprocess.run(["notify-send", message], check=False)
+def popup(msg):
+    subprocess.run(["notify-send", msg], check=False)
 
 
-def format_cansend(can_id: int, data: bytes) -> str:
-    return f"cansend {VCAN} {can_id:03X}#{data.hex().upper()}"
+def mph_to_kmh(mph):
+    return mph * KMH_PER_MPH
 
 
-def send_can_frame(bus: can.Bus, can_id: int, data: bytes, action_desc: str, repeat: int = 3, delay: float = 0.05) -> None:
-    cmd_str = format_cansend(can_id, data)
+def trigger_mph_from_target_kmh(target_kmh):
+    # lấy mốc gần nhất nhưng KHÔNG vượt target
+    return math.floor(target_kmh / KMH_PER_MPH)
 
-    log(f"[TX-REQUEST] {action_desc}")
-    log(f"[TX-CMD] {cmd_str}")
+
+def send_frame(bus, can_id, data, desc, repeat=3, delay=0.05):
+    msg = can.Message(
+        arbitration_id=can_id,
+        data=data,
+        is_extended_id=False
+    )
 
     try:
-        msg = can.Message(
-            arbitration_id=can_id,
-            data=data,
-            is_extended_id=False
-        )
-
-        for i in range(repeat):
+        for _ in range(repeat):
             bus.send(msg)
-            log(f"[TX-SENT] ({i+1}/{repeat}) {cmd_str}")
             time.sleep(delay)
 
-        log(f"[TX-OK] Completed: {action_desc}")
+        log(f"[ACTION] {desc} -> sent {repeat}x {can_id:03X}#{data.hex().upper()}")
 
     except can.CanError as e:
-        log(f"[TX-ERROR] Failed to send frame: {cmd_str}")
-        log(f"[TX-ERROR] Reason: {e}")
+        log(f"[ERROR] Cannot send {can_id:03X}#{data.hex().upper()} | {e}")
 
 
-def send_right_signal(bus: can.Bus) -> None:
-    # 47D#000000000002
-    data = bytes([0x00, 0x00, 0x00, 0x00, 0x00, 0x02])
-    send_can_frame(
-        bus=bus,
-        can_id=SIGNAL_ID,
-        data=data,
-        action_desc="Turn RIGHT signal ON"
+def send_right_signal(bus):
+    send_frame(
+        bus,
+        SIGNAL_ID,
+        bytes([0x00, 0x00, 0x00, 0x00, 0x00, 0x02]),
+        "Turn RIGHT signal ON"
     )
 
 
-def open_all_doors(bus: can.Bus) -> None:
-    # 474#00
-    data = bytes([0x00])
-    send_can_frame(
-        bus=bus,
-        can_id=DOOR_ID,
-        data=data,
-        action_desc="Open ALL doors"
+def open_all_doors(bus):
+    send_frame(
+        bus,
+        DOOR_ID,
+        bytes([0x00]),
+        "Open ALL doors"
     )
 
 
-def main() -> None:
-    global done_30, done_60, done_90
+MILESTONES = [
+    {
+        "target_kmh": 30.0,
+        "popup_text": "Vehicle is near 30 km/h",
+        "action": None,
+        "done": False,
+    },
+    {
+        "target_kmh": 60.0,
+        "popup_text": "Vehicle is near 60 km/h - Turn right signal ON",
+        "action": send_right_signal,
+        "done": False,
+    },
+    {
+        "target_kmh": 90.0,
+        "popup_text": "Vehicle is near 90 km/h - Open all doors",
+        "action": open_all_doors,
+        "done": False,
+    },
+]
 
-    log("[INIT] Starting auto CAN action script...")
-    log(f"[INIT] Interface: {VCAN}")
-    log(f"[INIT] SPEED_ID = 0x{SPEED_ID:03X}")
-    log(f"[INIT] SIGNAL_ID = 0x{SIGNAL_ID:03X}")
-    log(f"[INIT] DOOR_ID = 0x{DOOR_ID:03X}")
-    log("[INIT] Thresholds:")
-    log(f"       30 km/h  -> {THRESHOLD_30_KMH_MPH} mph")
-    log(f"       60 km/h  -> {THRESHOLD_60_KMH_MPH} mph")
-    log(f"       90 km/h  -> {THRESHOLD_90_KMH_MPH} mph")
+for m in MILESTONES:
+    m["trigger_mph"] = trigger_mph_from_target_kmh(m["target_kmh"])
+    m["trigger_kmh"] = mph_to_kmh(m["trigger_mph"])
+
+
+def main():
+    global last_speed_mph
 
     try:
         bus = can.interface.Bus(channel=VCAN, interface="socketcan")
     except Exception as e:
-        log(f"[FATAL] Cannot open CAN interface {VCAN}: {e}")
+        log(f"[FATAL] Cannot open {VCAN}: {e}")
         return
 
-    log("[LISTEN] Waiting for speed frames on 0x3EA ...")
+    log("[START] Listening for speed frames on 0x3EA")
+    for m in MILESTONES:
+        log(
+            f"[INIT] target {m['target_kmh']:.1f} km/h"
+            f" -> trigger at closest <= value: {m['trigger_mph']} mph ({m['trigger_kmh']:.1f} km/h)"
+        )
 
     while True:
         try:
             msg = bus.recv()
         except KeyboardInterrupt:
-            log("[EXIT] Stopped by user.")
+            log("[EXIT] Stopped by user")
             break
         except Exception as e:
-            log(f"[RX-ERROR] bus.recv() failed: {e}")
+            log(f"[ERROR] recv failed: {e}")
             continue
 
-        if msg is None:
-            continue
-
-        if msg.arbitration_id != SPEED_ID:
+        if not msg or msg.arbitration_id != SPEED_ID:
             continue
 
         if len(msg.data) != 7:
-            log(f"[RX-WARN] Unexpected DLC for 0x3EA: {len(msg.data)} (expected 7)")
             continue
 
         speed_mph = msg.data[6]
-        speed_kmh = speed_mph * 1.60934
+        speed_kmh = mph_to_kmh(speed_mph)
 
-        log(f"[SPEED] {speed_mph:>3} mph | {speed_kmh:>6.1f} km/h | raw frame: 3EA#{msg.data.hex().upper()}")
+        if speed_mph != last_speed_mph:
+            log(f"[SPEED] {speed_mph} mph | {speed_kmh:.1f} km/h")
+            last_speed_mph = speed_mph
 
-        # reset trigger khi tốc độ tụt xuống dưới ngưỡng
-        if speed_mph < THRESHOLD_30_KMH_MPH and done_30:
-            log("[RESET] Speed dropped below 30 km/h threshold -> re-arm milestone 30")
-            done_30 = False
+        for m in MILESTONES:
+            if speed_mph < m["trigger_mph"]:
+                m["done"] = False
 
-        if speed_mph < THRESHOLD_60_KMH_MPH and done_60:
-            log("[RESET] Speed dropped below 60 km/h threshold -> re-arm milestone 60")
-            done_60 = False
+            if speed_mph >= m["trigger_mph"] and not m["done"]:
+                popup(m["popup_text"])
+                log(
+                    f"[MILESTONE] near {m['target_kmh']:.1f} km/h"
+                    f" -> triggered at {m['trigger_kmh']:.1f} km/h ({m['trigger_mph']} mph)"
+                )
 
-        if speed_mph < THRESHOLD_90_KMH_MPH and done_90:
-            log("[RESET] Speed dropped below 90 km/h threshold -> re-arm milestone 90")
-            done_90 = False
+                if m["action"] is not None:
+                    m["action"](bus)
 
-        # Milestone 30 km/h
-        if speed_mph >= THRESHOLD_30_KMH_MPH and not done_30:
-            log("[MILESTONE] Reached 30 km/h threshold (~19 mph)")
-            popup("Vehicle reaches 30 km/h")
-            log("[POPUP] Vehicle reaches 30 km/h")
-            done_30 = True
-
-        # Milestone 60 km/h
-        if speed_mph >= THRESHOLD_60_KMH_MPH and not done_60:
-            log("[MILESTONE] Reached 60 km/h threshold (~37 mph)")
-            popup("Vehicle reaches 60 km/h - Turn right signal ON")
-            log("[POPUP] Vehicle reaches 60 km/h - Turn right signal ON")
-            send_right_signal(bus)
-            done_60 = True
-
-        # Milestone 90 km/h
-        if speed_mph >= THRESHOLD_90_KMH_MPH and not done_90:
-            log("[MILESTONE] Reached 90 km/h threshold (~56 mph)")
-            popup("Vehicle reaches 90 km/h - Open all doors")
-            log("[POPUP] Vehicle reaches 90 km/h - Open all doors")
-            open_all_doors(bus)
-            done_90 = True
+                m["done"] = True
 
 
 if __name__ == "__main__":
