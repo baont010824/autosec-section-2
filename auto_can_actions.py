@@ -1,7 +1,6 @@
 import can
 import subprocess
 import time
-import math
 from datetime import datetime
 
 VCAN = "vcan0"
@@ -10,9 +9,10 @@ SPEED_ID = 0x3EA
 SIGNAL_ID = 0x47D
 DOOR_ID = 0x474
 
-KMH_PER_MPH = 1.60934
+KMH_TO_MPH = 0.6213751
+SPEED_POS = 6
 
-last_speed_mph = None
+last_speed_raw = None
 
 
 def now_str():
@@ -25,15 +25,6 @@ def log(msg):
 
 def popup(msg):
     subprocess.run(["notify-send", msg], check=False)
-
-
-def mph_to_kmh(mph):
-    return mph * KMH_PER_MPH
-
-
-def trigger_mph_from_target_kmh(target_kmh):
-    # lấy mốc gần nhất nhưng KHÔNG vượt target
-    return math.floor(target_kmh / KMH_PER_MPH)
 
 
 def send_frame(bus, can_id, data, desc, repeat=3, delay=0.05):
@@ -72,34 +63,60 @@ def open_all_doors(bus):
     )
 
 
+def normalize_speed_payload(data):
+    """
+    Chuẩn hóa payload speed:
+    - 8 byte: dùng nguyên
+    - 7 byte: pad thêm 0x00 ở cuối
+    - <7 byte: bỏ
+    """
+    dlc = len(data)
+
+    if dlc >= 8:
+        return bytes(data[:8])
+
+    if dlc == 7:
+        return bytes(data) + b"\x00"
+
+    return None
+
+
+def decode_icsim_speed(msg):
+    payload = normalize_speed_payload(msg.data)
+    if payload is None:
+        return None, None, None
+
+    raw = (payload[SPEED_POS] << 8) | payload[SPEED_POS + 1]
+    speed_kmh = raw / 100.0
+    speed_mph = speed_kmh * KMH_TO_MPH
+
+    return raw, speed_kmh, speed_mph
+
+
 MILESTONES = [
     {
-        "target_kmh": 30.0,
-        "popup_text": "Vehicle is near 30 km/h",
+        "target_mph": 18.0,
+        "popup_text": "Vehicle reached 18 mph ~ 30kmh",
         "action": None,
         "done": False,
     },
     {
-        "target_kmh": 60.0,
-        "popup_text": "Vehicle is near 60 km/h - Turn right signal ON",
+        "target_mph": 37.0,
+        "popup_text": "Vehicle reached 37 mph ~ 60kmh - Turn right signal ON",
         "action": send_right_signal,
         "done": False,
     },
     {
-        "target_kmh": 90.0,
-        "popup_text": "Vehicle is near 90 km/h - Open all doors",
+        "target_mph": 55.0,
+        "popup_text": "Vehicle reached 55 mph ~ 90kmh - Open all doors",
         "action": open_all_doors,
         "done": False,
     },
 ]
 
-for m in MILESTONES:
-    m["trigger_mph"] = trigger_mph_from_target_kmh(m["target_kmh"])
-    m["trigger_kmh"] = mph_to_kmh(m["trigger_mph"])
-
 
 def main():
-    global last_speed_mph
+    global last_speed_raw
 
     try:
         bus = can.interface.Bus(channel=VCAN, interface="socketcan")
@@ -107,16 +124,14 @@ def main():
         log(f"[FATAL] Cannot open {VCAN}: {e}")
         return
 
-    log("[START] Listening for speed frames on 0x3EA")
+    log(f"[START] Listening for speed frames on 0x{SPEED_ID:03X}")
+
     for m in MILESTONES:
-        log(
-            f"[INIT] target {m['target_kmh']:.1f} km/h"
-            f" -> trigger at closest <= value: {m['trigger_mph']} mph ({m['trigger_kmh']:.1f} km/h)"
-        )
+        log(f"[INIT] milestone at {m['target_mph']:.1f} mph")
 
     while True:
         try:
-            msg = bus.recv()
+            msg = bus.recv(timeout=0.5)
         except KeyboardInterrupt:
             log("[EXIT] Stopped by user")
             break
@@ -124,28 +139,31 @@ def main():
             log(f"[ERROR] recv failed: {e}")
             continue
 
-        if not msg or msg.arbitration_id != SPEED_ID:
+        if msg is None:
             continue
 
-        if len(msg.data) != 7:
+        if msg.arbitration_id != SPEED_ID:
             continue
 
-        speed_mph = msg.data[6]
-        speed_kmh = mph_to_kmh(speed_mph)
+        raw, speed_kmh, speed_mph = decode_icsim_speed(msg)
+        if raw is None:
+            continue
 
-        if speed_mph != last_speed_mph:
-            log(f"[SPEED] {speed_mph} mph | {speed_kmh:.1f} km/h")
-            last_speed_mph = speed_mph
+        if raw != last_speed_raw:
+            log(
+                f"[SPEED] raw=0x{raw:04X} | mph={speed_mph:.2f} | kmh={speed_kmh:.2f}"
+            )
+            last_speed_raw = raw
 
         for m in MILESTONES:
-            if speed_mph < m["trigger_mph"]:
+            if speed_mph < m["target_mph"]:
                 m["done"] = False
 
-            if speed_mph >= m["trigger_mph"] and not m["done"]:
+            if speed_mph >= m["target_mph"] and not m["done"]:
                 popup(m["popup_text"])
                 log(
-                    f"[MILESTONE] near {m['target_kmh']:.1f} km/h"
-                    f" -> triggered at {m['trigger_kmh']:.1f} km/h ({m['trigger_mph']} mph)"
+                    f"[MILESTONE] reached {m['target_mph']:.1f} mph "
+                    f"(mph={speed_mph:.2f} | kmh={speed_kmh:.2f})"
                 )
 
                 if m["action"] is not None:
